@@ -1,0 +1,16 @@
+name: lmna-scrna-tf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - anndata
+  - scanpy
+  - tqdm
+  - pip:
+      - tensorflow==2.15.*
