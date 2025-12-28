@@ -32,15 +32,61 @@ SAMPLES = {
     "GSM8325057": ("Patient", 19, "A"),
 }
 
-TRAIN_SAMPLES = [
+DAYS = [0, 2, 4, 9, 16, 19, 30]
+DAY_TO_CLASS = {d: i for i, d in enumerate(DAYS)}
+
+
+# ---- Split schemes ----
+ORIG_TRAIN_SAMPLES = [
     "GSM8325046", "GSM8325047", "GSM8325048", "GSM8325050",
     "GSM8325051", "GSM8325053", "GSM8325055", "GSM8325057",
 ]
-VAL_SAMPLES = ["GSM8325049", "GSM8325054"]
-TEST_SAMPLES = ["GSM8325052", "GSM8325056"]
+ORIG_VAL_SAMPLES = ["GSM8325049", "GSM8325054"]
+ORIG_TEST_SAMPLES = ["GSM8325052", "GSM8325056"]
 
-DAYS = [0, 2, 4, 9, 16, 19, 30]
-DAY_TO_CLASS = {d: i for i, d in enumerate(DAYS)}
+
+def build_split_lists(
+    scheme: str,
+    seed: int,
+    test_day: int = 0,
+    val_day: int = 16,
+    take: str = "all",   # "all" or "first"
+):
+    """
+    Returns (train_samples, val_samples, test_samples) as GSM lists.
+
+    scheme:
+      - "original": use the hardcoded lists (current behavior)
+      - "day_matched": test/val are (control+patient) from the same day
+    """
+    scheme = scheme.lower()
+    if scheme == "original":
+        return ORIG_TRAIN_SAMPLES, ORIG_VAL_SAMPLES, ORIG_TEST_SAMPLES
+
+    if scheme != "day_matched":
+        raise ValueError(f"Unknown split scheme: {scheme}")
+
+    def pick(day: int, condition: str):
+        gsms = [gsm for gsm, (cond, d, rep) in SAMPLES.items() if cond == condition and d == day]
+        gsms = sorted(gsms)
+        if take == "first":
+            return gsms[:1]
+        return gsms
+
+    test = set(pick(test_day, "Control") + pick(test_day, "Patient"))
+    val  = set(pick(val_day,  "Control") + pick(val_day,  "Patient"))
+
+    def has_both(gset: set[str]) -> bool:
+        conds = {SAMPLES[g][0] for g in gset}
+        return conds == {"Control", "Patient"}
+
+    if not has_both(test):
+        raise RuntimeError(f"day_matched test_day={test_day} does not contain BOTH Control+Patient: {sorted(test)}")
+    if not has_both(val):
+        raise RuntimeError(f"day_matched val_day={val_day} does not contain BOTH Control+Patient: {sorted(val)}")
+
+    train = sorted([gsm for gsm in SAMPLES.keys() if gsm not in test and gsm not in val])
+    return train, sorted(list(val)), sorted(list(test))
 
 
 # -----------------------------
@@ -181,13 +227,6 @@ def normalize_total_log1p_inplace(X: sparse.csr_matrix, target_sum: float = 1e4)
     return X
 
 
-def split_of(gsm: str) -> str:
-    if gsm in TRAIN_SAMPLES: return "train"
-    if gsm in VAL_SAMPLES:   return "val"
-    if gsm in TEST_SAMPLES:  return "test"
-    return "ignore"
-
-
 def scale_sparse_columns_inplace(X: sparse.csr_matrix, inv_std: np.ndarray, clip: float) -> sparse.csr_matrix:
     # multiply columns by inv_std using right-multiply with diagonal matrix
     X = X.dot(sparse.diags(inv_std)).tocsr()
@@ -212,6 +251,10 @@ def main(
     n_hvg: int,
     scale_clip: float,
     target_sum: float,
+    split_scheme: str,
+    split_test_day: int,
+    split_val_day: int,
+    split_take: str,
 ):
     raw_root_p = Path(raw_root)
     out_dir_p = Path(out_dir)
@@ -223,7 +266,24 @@ def main(
     if missing:
         raise RuntimeError(f"Nenašel jsem {which} soubory pro: {missing}")
 
-    gsm_list = sorted(gsm_files.keys())
+    # IMPORTANT: only process the samples we actually declared in SAMPLES
+    gsm_list = sorted(SAMPLES.keys())
+
+    # ---- choose split scheme (REPRODUCIBLE) ----
+    train_samples, val_samples, test_samples = build_split_lists(
+        scheme=split_scheme,
+        seed=seed,
+        test_day=split_test_day,
+        val_day=split_val_day,
+        take=split_take,
+    )
+    train_set, val_set, test_set = set(train_samples), set(val_samples), set(test_samples)
+
+    def split_of(gsm: str) -> str:
+        if gsm in train_set: return "train"
+        if gsm in val_set:   return "val"
+        if gsm in test_set:  return "test"
+        return "ignore"
 
     # ---- Pass 0: define gene universe from first sample
     genes0 = load_features(gsm_files[gsm_list[0]]["features"])
@@ -368,9 +428,15 @@ def main(
         },
         "scale": {"zero_center": False, "clip": float(scale_clip)},
         "splits": {
-            "train_samples": TRAIN_SAMPLES,
-            "val_samples": VAL_SAMPLES,
-            "test_samples": TEST_SAMPLES,
+            "train_samples": train_samples,
+            "val_samples": val_samples,
+            "test_samples": test_samples,
+        },
+        "split_scheme": {
+            "name": split_scheme,
+            "test_day": int(split_test_day),
+            "val_day": int(split_val_day),
+            "take": split_take,
         },
         "day_to_class": DAY_TO_CLASS,
         "pass1": {
@@ -417,6 +483,12 @@ if __name__ == "__main__":
     ap.add_argument("--scale_clip", type=float, default=10.0)
     ap.add_argument("--target_sum", type=float, default=1e4)
 
+    # ---- split scheme params ----
+    ap.add_argument("--split_scheme", choices=["original", "day_matched"], default="original")
+    ap.add_argument("--split_test_day", type=int, default=0)
+    ap.add_argument("--split_val_day", type=int, default=16)
+    ap.add_argument("--split_take", choices=["all", "first"], default="all")
+
     args = ap.parse_args()
 
     main(
@@ -432,5 +504,8 @@ if __name__ == "__main__":
         n_hvg=args.n_hvg,
         scale_clip=args.scale_clip,
         target_sum=args.target_sum,
+        split_scheme=args.split_scheme,
+        split_test_day=args.split_test_day,
+        split_val_day=args.split_val_day,
+        split_take=args.split_take,
     )
-
