@@ -478,7 +478,7 @@ if __name__ == "__main__":
     ap.add_argument("--qc_max_mito_pct", type=float, default=20.0)
 
     ap.add_argument("--min_cells_per_gene", type=int, default=10)
-    ap.add_argument("--n_hvg", type=int, default=1000)
+    ap.add_argument("--n_hvg", type=int, default=2000)
 
     ap.add_argument("--scale_clip", type=float, default=10.0)
     ap.add_argument("--target_sum", type=float, default=1e4)
