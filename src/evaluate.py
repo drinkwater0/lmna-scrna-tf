@@ -144,9 +144,9 @@ def main(run_dir: str, threshold: float, invert_prob: bool):
     history = _load_json(history_path)
     y_true = np.load(y_path).astype(np.int64)
     y_prob = np.load(p_path).astype(np.float32).reshape(-1)
-    if invert_prob:
+    if invert_prob == True:
         y_prob = 1.0 - y_prob
-
+    
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,6 +176,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", required=True, help="e.g. outputs/runs/model_A")
     ap.add_argument("--threshold", type=float, default=0.5)
-    ap.add_argument("--invert_prob", type=bool, default=False, help="invert results?")
+    ap.add_argument("--invert_prob", action="store_true", help="If set, use 1 - p.")
     args = ap.parse_args()
     main(args.run_dir, args.threshold, args.invert_prob)
