@@ -1,85 +1,172 @@
-LMNA scRNA-seq TensorFlow pipeline
+# LMNA scRNA-seq classification (TensorFlow/Keras)
 
-This repo contains a fully repeatable pipeline for dataset preparation, training, sweeps, and evaluation.
+Reproducible pipeline to classify **patient vs control status** from single-cell RNA-seq (scRNA-seq) in GEO **GSE269705**.
+The repository implements:
 
-Setup
-1) Create the environment (recommended)
-   conda env create -f environment.yml
-   conda activate lmna-scrna-tf
+- RAM-safe preprocessing of 10x-style matrices into an ML-ready sparse feature matrix
+- **GSM-level** train/val/test splits (no within-library leakage)
+- A **day-matched** split scheme to reduce day-genotype confounding
+- Two models:
+  - **Model A**: genotype-only MLP
+  - **Model B**: multitask MLP (genotype + auxiliary day head)
+- Training, evaluation plots, and a small sweep (course requirement)
 
-2) If you do not use conda, install dependencies listed in environment.yml
-   (TensorFlow 2.15.* expects Python 3.11).
+If you use this repo for the paper, include the compiled PDF in `paper/` and link it from here.
 
-Data download and extraction
-1) Download GEO raw archive (about 4.8 GB)
-   python src/download_geo.py
+---
 
-2) Extract files (expects flat directory with *_matrix.mtx.gz, *_barcodes.tsv.gz, *_features.tsv.gz)
-   mkdir -p data/raw/extracted
-   tar -xf data/raw/GSE269705_RAW.tar -C data/raw/extracted
+## Repository structure
 
-Prepare datasets (reproducible splits)
-Default behavior uses filtered 10x files.
+- `src/download_geo.py` - download GEO raw archive
+- `src/prepare_dataset.py` - preprocessing + split creation (train-only HVG/scaling)
+- `src/train.py` - train Model A or B on a prepared dataset
+- `src/evaluate.py` - generate ROC/curves/confusion matrix and summary JSON
+- `src/sweep.py` - small sweep for Model A and a simple Model B follow-up
 
-Original split (baseline)
-  python src/prepare_dataset.py --out_dir data/processed_original --split_scheme original
+Typical outputs go to:
+- `data/processed_*` - prepared datasets (sparse matrices + labels + metadata)
+- `outputs/runs/<run_name>/` - models, metrics, plots
 
-Day-matched split (recommended for leakage control)
-  python src/prepare_dataset.py --out_dir data/processed_dm_t19_v0 --split_scheme day_matched --split_test_day 19 --split_val_day 0
+---
 
-You can create multiple day-matched variants as needed:
-  python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16 --split_scheme day_matched --split_test_day 0  --split_val_day 16
-  python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0 --split_scheme day_matched --split_test_day 16 --split_val_day 0
+## Setup
 
-Leakage control note:
-HVG selection and scaling statistics are fit on the training split only, then frozen and applied to val/test.
+### Option A: conda (recommended)
+```bash
+conda env create -f environment.yml
+conda activate lmna-scrna-tf
+```
 
-Minimal course sweep (Model A only)
-This sweep covers:
-single-layer vs multi-layer, epochs, batch size, activation, optimizer.
+### Option B: pip
+Install dependencies equivalent to `environment.yml`.
+Note: TensorFlow 2.15.* expects Python 3.11.
 
-  python src/sweep.py --model A --data_dir data/processed_dm_t19_v0
+---
 
-The results CSV is written to:
-  outputs/runs/results.csv
+## Data download + extraction (GSE269705)
 
-You can choose the CSV name or path:
-  python src/sweep.py --model A --data_dir data/processed_dm_t19_v0 --out_csv results_dm_t19.csv
+1) Download the raw GEO archive (~4.8 GB):
+```bash
+python src/download_geo.py
+```
 
-Model B (auxiliary day head)
-Model B uses the best Model A config and varies only loss_w_day (0.1/0.3/0.5).
-It picks the best A run from outputs/runs/results.csv unless you override it.
+2) Extract into a flat directory:
+```bash
+mkdir -p data/raw/extracted
+tar -xf data/raw/GSE269705_RAW.tar -C data/raw/extracted
+```
 
-  python src/sweep.py --model B --data_dir data/processed_dm_t19_v0
+Expected per-GSM files:
+- `*_matrix.mtx.gz`
+- `*_barcodes.tsv.gz`
+- `*_features.tsv.gz`
 
-Optional overrides:
-  python src/sweep.py --model B --best_a_run A_d2_e20_b128_relu_adam --data_dir data/processed_dm_t19_v0
-  python src/sweep.py --model B --best_a_csv outputs/runs/results_A.csv --data_dir data/processed_dm_t19_v0
+---
 
-Evaluation plots
-After any training run, generate plots and a summary:
-  python src/evaluate.py --run_dir outputs/runs/<run_name>
+## Dataset preparation (reproducible splits)
 
-Artifacts written per run
-- outputs/runs/<run_name>/model.keras
-- outputs/runs/<run_name>/history.json
-- outputs/runs/<run_name>/config.json
-- outputs/runs/<run_name>/test_metrics.json
-- outputs/runs/<run_name>/plots/*.png
-- outputs/runs/<run_name>/y_test.npy, p_test.npy (and day outputs for Model B)
+All splits are performed at the **GSM (library) level**.
 
-Reproducibility notes
-- The dataset preparation is seeded; keep the same split flags for repeatable splits.
-- The training script uses a fixed seed; results should be repeatable when the same
-  environment and GPU/CPU backend are used.
+### Original split (baseline)
+```bash
+python src/prepare_dataset.py \
+  --out_dir data/processed_original \
+  --split_scheme original
+```
 
+### Day-matched split (confound-reduced; recommended)
+Choose `--split_test_day` and `--split_val_day`. Example used in the paper:
+```bash
+python src/prepare_dataset.py \
+  --out_dir data/processed_dm_t19_v0 \
+  --split_scheme day_matched \
+  --split_test_day 19 \
+  --split_val_day 0
+```
 
+Other variants (also used in comparisons):
+```bash
+python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16  --split_scheme day_matched --split_test_day 0  --split_val_day 16
+python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0  --split_scheme day_matched --split_test_day 16 --split_val_day 0
+```
 
+### Leakage control (important)
+**HVG selection and scaling are fit on TRAIN only**, then frozen and applied to validation/test.
+This prevents preprocessing leakage.
 
+---
 
-One-piece command snippet to run after preparing dataset.
+## Training (Model A / Model B)
 
-# 1) Rebuild datasets (train‑only HVG/scaling)
+### Train Model A (genotype-only)
+```bash
+python src/train.py \
+  --data_dir data/processed_dm_t19_v0 \
+  --out_dir outputs/runs/dm_t19_v0_A \
+  --model A
+```
+
+### Train Model B (genotype + auxiliary day head)
+```bash
+python src/train.py \
+  --data_dir data/processed_dm_t19_v0 \
+  --out_dir outputs/runs/dm_t19_v0_B \
+  --model B
+```
+
+---
+
+## Evaluation plots
+
+After any run:
+```bash
+python src/evaluate.py --run_dir outputs/runs/<run_name>
+```
+
+This writes:
+- `plots/*.png` (ROC curve, confusion matrix, training curves, etc.)
+- `plots_summary.json` (plot summary for that run)
+- `y_test.npy`, `p_test.npy` (and day outputs for Model B)
+
+---
+
+## Minimal sweep (course requirement)
+
+### Model A sweep (depth / epochs / batch / activation / optimizer)
+```bash
+python src/sweep.py --model A --data_dir data/processed_dm_t19_v0
+```
+
+By default it writes:
+- `outputs/runs/results.csv`
+
+Custom CSV:
+```bash
+python src/sweep.py --model A --data_dir data/processed_dm_t19_v0 --out_csv results_dm_t19.csv
+```
+
+### Model B sweep (loss weight for auxiliary day head)
+Model B uses the best Model A config and varies `loss_w_day` (e.g., 0.1/0.3/0.5).
+It selects the best A run from the results CSV unless overridden.
+
+```bash
+python src/sweep.py --model B --data_dir data/processed_dm_t19_v0
+```
+
+Overrides:
+```bash
+python src/sweep.py --model B --best_a_run A_d2_e20_b128_relu_adam --data_dir data/processed_dm_t19_v0
+python src/sweep.py --model B --best_a_csv outputs/runs/results_A.csv --data_dir data/processed_dm_t19_v0
+```
+
+---
+
+## Full reproduction (paper tables/figures)
+
+Run this from the repo root after setting up the environment and extracting data:
+
+```bash
+# 1) Build datasets (train-only HVG/scaling)
 python src/prepare_dataset.py --out_dir data/processed_original  --split_scheme original
 python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16 --split_scheme day_matched --split_test_day 0  --split_val_day 16
 python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0 --split_scheme day_matched --split_test_day 16 --split_val_day 0
@@ -95,7 +182,7 @@ python src/train.py --data_dir data/processed_dm_t16_v0 --out_dir outputs/runs/d
 python src/train.py --data_dir data/processed_dm_t19_v0 --out_dir outputs/runs/dm_t19_v0_A --model A
 python src/train.py --data_dir data/processed_dm_t19_v0 --out_dir outputs/runs/dm_t19_v0_B --model B
 
-# 3) (Optional) evaluation plots for each run
+# 3) Evaluation plots for each run (optional, but recommended)
 python src/evaluate.py --run_dir outputs/runs/orig_A
 python src/evaluate.py --run_dir outputs/runs/orig_B
 python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_A
@@ -105,11 +192,26 @@ python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_B
 python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_A
 python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_B
 
-# 4) Table 1 data (genotype‑head metrics for Model B)
-python src/make_table1.py
-
-# 5) AUC comparison figure (Model A vs B across splits)
-python src/plot_auc_splits.py
-
-# 6) Sweep table (Model A on dm_t19_v0)
+# 4) Sweep table (Model A on dm_t19_v0)
 python src/sweep.py --model A --data_dir data/processed_dm_t19_v0 --out_csv results.csv
+```
+
+If your repo includes helper scripts for the paper:
+```bash
+python src/make_table1.py
+python src/plot_auc_splits.py
+```
+
+---
+
+## Notes on reproducibility
+
+- Dataset preparation is seeded; using the same split flags yields repeatable splits.
+- Training also uses a fixed seed; minor numeric differences may still occur across CPU/GPU backends.
+
+---
+
+## Data
+
+
+- Data: GSE269705 is hosted by NCBI GEO; this repo provides scripts to download and process it.
