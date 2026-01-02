@@ -92,6 +92,10 @@ def build_split_lists(
 # -----------------------------
 # Helpers
 # -----------------------------
+def rng(seed: int) -> np.random.Generator:
+    return np.random.default_rng(seed)
+
+
 def make_unique(names: np.ndarray) -> np.ndarray:
     seen: dict[str, int] = {}
     out: list[str] = []
@@ -159,17 +163,9 @@ def transpose_if_needed(X: sparse.csr_matrix, n_genes: int, n_cells: int) -> spa
     raise RuntimeError(f"Shape mismatch: X={X.shape}, genes={n_genes}, cells={n_cells}")
 
 
-def _sample_seed(base_seed: int, gsm: str) -> int:
-    # stable per-sample seed so PASS1 and PASS2 downsample the SAME cells
-    # gsm numeric part is stable (e.g., GSM8325046 -> 8325046)
-    gid = int(gsm.replace("GSM", ""))
-    return int((base_seed * 1_000_003 + gid) % (2**32))
-
-
-def downsample_rows(X: sparse.csr_matrix, barcodes: np.ndarray, max_cells: int, base_seed: int, gsm: str):
+def downsample_rows(X: sparse.csr_matrix, barcodes: np.ndarray, max_cells: int, r: np.random.Generator):
     if max_cells <= 0 or X.shape[0] <= max_cells:
         return X, barcodes
-    r = np.random.default_rng(_sample_seed(base_seed, gsm))
     idx = r.choice(X.shape[0], size=max_cells, replace=False)
     idx.sort()
     return X[idx], barcodes[idx]
@@ -183,15 +179,18 @@ def qc_filter_cells(
     max_genes: int,
     max_mito_pct: float,
 ):
+    # n_genes_by_counts: number of nonzero genes per cell
     n_genes = X.getnnz(axis=1)
     total_counts = np.asarray(X.sum(axis=1)).ravel()
 
+    # mito counts
     if mt_mask.any():
         X_mt = X[:, mt_mask]
         mt_counts = np.asarray(X_mt.sum(axis=1)).ravel()
     else:
         mt_counts = np.zeros_like(total_counts)
 
+    # percent mito (avoid div by zero)
     pct_mt = np.zeros_like(total_counts, dtype=np.float32)
     nz = total_counts > 0
     pct_mt[nz] = (mt_counts[nz] / total_counts[nz]) * 100.0
@@ -214,17 +213,22 @@ def qc_filter_cells(
 
 
 def normalize_total_log1p_inplace(X: sparse.csr_matrix, target_sum: float = 1e4) -> sparse.csr_matrix:
+    # scale each row so that row sum == target_sum, then log1p on nonzeros
     row_sums = np.asarray(X.sum(axis=1)).ravel().astype(np.float32)
     scale = np.zeros_like(row_sums)
     nz = row_sums > 0
     scale[nz] = target_sum / row_sums[nz]
 
+    # multiply rows: X = diag(scale) @ X
     X = sparse.diags(scale).dot(X).tocsr()
+
+    # log1p on nonzeros only
     X.data = np.log1p(X.data).astype(np.float32)
     return X
 
 
 def scale_sparse_columns_inplace(X: sparse.csr_matrix, inv_std: np.ndarray, clip: float) -> sparse.csr_matrix:
+    # multiply columns by inv_std using right-multiply with diagonal matrix
     X = X.dot(sparse.diags(inv_std)).tocsr()
     if clip is not None:
         X.data = np.clip(X.data, -clip, clip).astype(np.float32)
@@ -255,12 +259,14 @@ def main(
     raw_root_p = Path(raw_root)
     out_dir_p = Path(out_dir)
     out_dir_p.mkdir(parents=True, exist_ok=True)
+    r = rng(seed)
 
     gsm_files = find_10x_files_flat(raw_root_p, which=which)
     missing = sorted(set(SAMPLES.keys()) - set(gsm_files.keys()))
     if missing:
         raise RuntimeError(f"Nenašel jsem {which} soubory pro: {missing}")
 
+    # IMPORTANT: only process the samples we actually declared in SAMPLES
     gsm_list = sorted(SAMPLES.keys())
 
     # ---- choose split scheme (REPRODUCIBLE) ----
@@ -279,16 +285,12 @@ def main(
         if gsm in test_set:  return "test"
         return "ignore"
 
-    pass1_list = [gsm for gsm in gsm_list if split_of(gsm) == "train"]
-    if len(pass1_list) == 0:
-        raise RuntimeError("PASS1 (train-only) je prázdný. Zkontroluj split_scheme / train_samples.")
-
-    # ---- Pass 0: define gene universe from first sample (any sample is fine; must match all)
+    # ---- Pass 0: define gene universe from first sample
     genes0 = load_features(gsm_files[gsm_list[0]]["features"])
     mt_mask0 = np.array([g.startswith("MT-") for g in genes0], dtype=bool)
     n_genes0 = len(genes0)
 
-    # Stats accumulators for HVG (computed on TRAIN ONLY)
+    # Stats accumulators for HVG (over normalized+log data)
     sum_g = np.zeros(n_genes0, dtype=np.float64)
     sumsq_g = np.zeros(n_genes0, dtype=np.float64)
     nnz_g = np.zeros(n_genes0, dtype=np.int64)
@@ -296,19 +298,20 @@ def main(
 
     qc_summary = {}
 
-    # ---- Pass 1: TRAIN ONLY (no leakage) ----
-    for gsm in tqdm(pass1_list, desc=f"PASS1 stats TRAIN ({which})"):
+    # ---- Pass 1: QC + normalize+log + accumulate gene stats (NO CONCAT)
+    for gsm in tqdm(gsm_list, desc=f"PASS1 stats ({which})"):
         f = gsm_files[gsm]
 
         genes = load_features(f["features"])
         if len(genes) != n_genes0 or not np.all(genes == genes0):
+            # If this happens, we can implement intersection mapping. For now, fail loudly.
             raise RuntimeError(f"[{gsm}] features.tsv.gz se liší od prvního vzorku (jiné geny/pořadí).")
 
         barcodes = load_barcodes(f["barcodes"])
         X = load_matrix_mtx(f["matrix"])
         X = transpose_if_needed(X, n_genes=n_genes0, n_cells=len(barcodes))
 
-        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, seed, gsm)
+        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, r)
         X, barcodes, qcinfo = qc_filter_cells(
             X, barcodes, mt_mask0, qc_min_genes, qc_max_genes, qc_max_mito_pct
         )
@@ -316,11 +319,13 @@ def main(
 
         X = normalize_total_log1p_inplace(X, target_sum=target_sum)
 
+        # accumulate stats
         sum_g += np.asarray(X.sum(axis=0)).ravel()
         sumsq_g += np.asarray(X.power(2).sum(axis=0)).ravel()
         nnz_g += X.getnnz(axis=0)
         n_cells_total += X.shape[0]
 
+    # gene eligibility: expressed in at least min_cells_per_gene cells
     eligible = nnz_g >= int(min_cells_per_gene)
     if eligible.sum() == 0:
         raise RuntimeError("Po gene filtru nezbyl žádný gen. Sniž min_cells_per_gene.")
@@ -330,6 +335,7 @@ def main(
     var = ex2 - mean * mean
     var[var < 0] = 0.0
 
+    # pick HVG among eligible
     eligible_idx = np.where(eligible)[0]
     var_eligible = var[eligible_idx]
     topk = min(int(n_hvg), len(eligible_idx))
@@ -338,11 +344,12 @@ def main(
 
     genes_hvg = genes0[hvg_idx]
 
+    # std for scaling (zero_center=False): divide by std
     std = np.sqrt(var[hvg_idx]).astype(np.float32)
     std[std == 0] = 1.0
     inv_std = (1.0 / std).astype(np.float32)
 
-    # ---- Pass 2: build final sparse X (only HVG) + labels (ALL splits) ----
+    # ---- Pass 2: build final sparse X (only HVG) + labels
     X_blocks = []
     y_geno_all = []
     y_day_all = []
@@ -356,15 +363,16 @@ def main(
         X = load_matrix_mtx(f["matrix"])
         X = transpose_if_needed(X, n_genes=n_genes0, n_cells=len(barcodes))
 
-        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, seed, gsm)
-        X, barcodes, qcinfo = qc_filter_cells(
+        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, r)
+        X, barcodes, _ = qc_filter_cells(
             X, barcodes, mt_mask0, qc_min_genes, qc_max_genes, qc_max_mito_pct
         )
-        qc_summary[gsm] = qcinfo  # now filled for ALL samples we touch
-
         X = normalize_total_log1p_inplace(X, target_sum=target_sum)
 
+        # subset HVG
         X = X[:, hvg_idx].tocsr()
+
+        # scale (no centering) + clip
         X = scale_sparse_columns_inplace(X, inv_std=inv_std, clip=scale_clip)
 
         sp = split_of(gsm)
@@ -381,6 +389,7 @@ def main(
         y_day_all.append(np.full(n, y_day, dtype=np.int64))
         gsm_all.append(np.full(n, gsm, dtype=object))
         split_all.append(np.full(n, sp, dtype=object))
+        # make unique cell ids
         cell_id_all.append(np.array([f"{gsm}:{bc}" for bc in barcodes], dtype=object))
 
     if not X_blocks:
@@ -415,9 +424,9 @@ def main(
         },
         "hvg": {
             "n_hvg": int(len(hvg_idx)),
-            "method": "variance_on_log_normalized (TRAIN only, streaming)",
+            "method": "variance_on_log_normalized (streaming)",
         },
-        "scale": {"zero_center": False, "clip": float(scale_clip), "fit_on": "TRAIN only"},
+        "scale": {"zero_center": False, "clip": float(scale_clip)},
         "splits": {
             "train_samples": train_samples,
             "val_samples": val_samples,
@@ -431,7 +440,6 @@ def main(
         },
         "day_to_class": DAY_TO_CLASS,
         "pass1": {
-            "samples_used": pass1_list,
             "n_cells_total_after_qc": int(n_cells_total),
             "eligible_genes": int(eligible.sum()),
         },
@@ -463,7 +471,7 @@ if __name__ == "__main__":
     ap.add_argument("--which", choices=["filtered", "raw"], default="filtered")
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--max_cells_per_sample", type=int, default=3000)
+    ap.add_argument("--max_cells_per_sample", type=int, default=3000)  # start safe
 
     ap.add_argument("--qc_min_genes", type=int, default=200)
     ap.add_argument("--qc_max_genes", type=int, default=6000)
@@ -475,6 +483,7 @@ if __name__ == "__main__":
     ap.add_argument("--scale_clip", type=float, default=10.0)
     ap.add_argument("--target_sum", type=float, default=1e4)
 
+    # ---- split scheme params ----
     ap.add_argument("--split_scheme", choices=["original", "day_matched"], default="original")
     ap.add_argument("--split_test_day", type=int, default=0)
     ap.add_argument("--split_val_day", type=int, default=16)
@@ -500,3 +509,4 @@ if __name__ == "__main__":
         split_val_day=args.split_val_day,
         split_take=args.split_take,
     )
+ 
