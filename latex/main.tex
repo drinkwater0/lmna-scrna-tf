@@ -1,0 +1,469 @@
+% Document for XeLaTeX (compile with XeLaTeX or LuaLaTeX)
+\documentclass[a4paper,oneside,11pt]{article}
+
+% ---- Fonts & language ----
+\usepackage{fontspec}
+\defaultfontfeatures{Ligatures=TeX, Scale=MatchLowercase}
+
+\setmainfont{TeX Gyre Pagella}
+\setsansfont{TeX Gyre Heros}
+\setmonofont{Inconsolata}
+
+\usepackage{polyglossia}
+\setdefaultlanguage{english}
+
+% ---- Typography & layout ----
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{microtype}
+\setlength{\parskip}{0.8ex plus 0.2ex minus 0.1ex}
+\setlength{\parindent}{0pt}
+
+% ---- Verbatim with line breaking ----
+\usepackage{fvextra}
+\DefineVerbatimEnvironment{cmd}{Verbatim}{
+  breaklines=true,
+  breakanywhere=true,
+  fontsize=\small
+}
+
+% ---- Math ----
+\usepackage{amsmath}
+
+% ---- Tables ----
+\usepackage{booktabs}
+
+% ---- Links & colors ----
+\usepackage[dvipsnames]{xcolor}
+\usepackage{hyperref}
+\hypersetup{
+    pdftitle={Single-cell RNA-seq classification of LMNA-related patient/control status using TensorFlow/Keras},
+    pdfauthor={Vladislav Karpe},
+    colorlinks=true,
+    linkcolor=RoyalBlue,
+    citecolor=RoyalBlue,
+    filecolor=RoyalBlue,
+    urlcolor=RoyalBlue
+}
+
+% ---- Figures ----
+\usepackage{graphicx}
+\usepackage{subcaption} % <--- added
+\usepackage{placeins}   % <--- added
+
+% ---- Float tuning (reduce "all floats at top of pages") ----
+\renewcommand{\topfraction}{0.90}
+\renewcommand{\textfraction}{0.08}
+\renewcommand{\floatpagefraction}{0.85}
+\setcounter{topnumber}{2}
+\setcounter{totalnumber}{4}
+
+% ---- Headings ----
+\usepackage[pagestyles]{titlesec}
+
+\titleformat{\part}[display]
+  {\filright}{\Large\sffamily Part \thepart}{0.25em}{\bfseries\sffamily\huge\upshape}
+\titleformat{\section}[block]
+  {\sffamily\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}[block]
+  {\sffamily\large\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}[block]
+  {\sffamily\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+\begin{document}
+
+% ---------------- Title page ----------------
+\thispagestyle{empty}
+\begin{center}
+    \vspace*{12mm}
+    {\Huge\sffamily\bfseries Single-cell RNA-seq classification of LMNA-related patient/control status using TensorFlow/Keras}
+
+    \vspace*{20mm}
+    {\Large\sffamily\bfseries Vladislav Karpe}
+
+    \vspace*{7.5mm}
+    {\large\sffamily 02.01.2026}
+\end{center}
+
+\vspace*{8mm}
+
+% ---------------- Abstract ----------------
+\begin{abstract}
+This work trains TensorFlow/Keras neural networks to classify \textbf{patient vs control status} from single-cell RNA-seq (scRNA-seq).
+We use the public GEO dataset GSE269705 (12 GSM sequencing libraries) measured across seven differentiation time points (days 0, 2, 4, 9, 16, 19, 30).
+Each cell is represented by a gene-expression vector. Labels (patient vs control and differentiation day) are inherited from the originating GSM library.
+Preprocessing follows a pipeline implemented under RAM constraints: per-cell quality control (min 200 genes, max 6000 genes, max 20\% mitochondrial reads), random subsampling up to 3000 cells per sample, total-count normalization to 10{,}000 counts per cell, log1p transform, selection of 1000 highly-variable genes by variance, and per-gene scaling by standard deviation with clipping at 10.
+To prevent preprocessing leakage, HVG selection and scaling factors are fit on \textbf{training GSMs only} and then applied unchanged to validation/test.
+We avoid library leakage via GSM-level splits, and we reduce day--genotype confounding with day-matched evaluation.
+We report results for a genotype-only multilayer perceptron (Model A) and a multitask variant with an auxiliary day-prediction head (Model B), and we include a small sweep over core hyperparameters (depth, epochs, batch size, activation, optimizer).
+\end{abstract}
+
+
+\vspace*{6mm}
+
+% ---------------- Introduction (KEEP the second one) ----------------
+\section{Introduction}
+\label{sec:introduction}
+
+Mutations in \textit{LMNA} (lamin A/C) are linked to laminopathies with cardiac and skeletal muscle involvement.
+Disease-associated effects can be reflected in cellular gene expression programs.
+Single-cell RNA sequencing (scRNA-seq) quantifies gene expression at the level of individual cells, enabling analysis of heterogeneous cell populations.
+
+In this project, we frame a supervised classification task: given a single cell's expression vector, predict whether the cell originates from a patient or a control sample.
+The dataset also includes multiple differentiation time points.
+We test whether adding the time point as an auxiliary prediction target improves patient/control classification.
+
+A practical challenge in scRNA-seq machine learning is avoiding information leakage.
+Cells sequenced within the same library share library-specific technical signatures (e.g., sequencing depth, ambient RNA, and batch effects).
+Here, one sequencing library corresponds to one GEO \texttt{GSM} sample.
+If individual cells were split randomly across train/validation/test, the model could exploit these library ``fingerprints,'' leading to overly optimistic test performance.
+Therefore, we use a \texttt{GSM}-level split: all cells from a given \texttt{GSM} are assigned to exactly one partition, and \texttt{GSM}s are disjoint across train/validation/test.
+
+\textbf{Contributions.}
+(i) A RAM-safe pipeline that converts scRNA-seq count matrices into an ML-ready dataset.
+(ii) A small hyperparameter sweep in TensorFlow/Keras (epochs, batch size, depth, activation, optimizer).
+(iii) Sample-level evaluation of a patient/control classifier (Model A) and a time-aware multi-task variant (Model B), including a split scheme that reduces day--genotype confounding.
+
+% ---------------- Methods ----------------
+\section{Methods}
+\label{sec:methods}
+
+\subsection{Dataset}
+\label{subsec:data}
+
+We used a public scRNA-seq dataset from NCBI GEO under accession \textbf{GSE269705}.
+The study contains \textbf{12 sequencing libraries} (GEO accessions \texttt{GSM8325046}--\texttt{GSM8325057}).
+In this report, each \texttt{GSM} is treated as one \textbf{sample/library}.
+
+\paragraph{10x-style files.}
+Each GSM is stored in the common ``10x Genomics sparse-matrix format'' layout:
+\texttt{matrix.mtx.gz} (sparse count matrix),
+\texttt{barcodes.tsv.gz} (cell IDs),
+\texttt{features.tsv.gz} (gene names).
+The matrix is sparse because most gene counts are zero for a given cell.
+
+\subsection{Labels}
+\label{subsec:labels}
+
+Each cell inherits labels from its source \texttt{GSM}:
+\begin{itemize}
+    \item \textbf{Genotype/condition} $y_{\mathrm{geno}} \in \{0,1\}$, where 0=Control and 1=Patient.
+    \item \textbf{Time point} $y_{\mathrm{day}} \in \{0,\dots,6\}$, encoding the differentiation day via the mapping $(0,2,4,9,16,19,30)\rightarrow(0,\dots,6)$.
+\end{itemize}
+
+\subsection{Train/validation/test splitting}
+\label{subsec:split}
+
+\subsubsection{GSM-level splitting (no library leakage)}
+\label{subsubsec:gsm_split}
+All splits are performed at the \texttt{GSM} (library) level to avoid within-library leakage.
+
+\subsubsection{Two split schemes}
+\label{subsubsec:split_schemes}
+
+We evaluate two split schemes implemented in \texttt{prepare\_dataset.py}:
+
+\paragraph{Original split (hard-coded GSM lists).}
+\begin{itemize}
+    \item Test: \texttt{GSM8325052} (Control, day 19) and \texttt{GSM8325056} (Patient, day 16)
+    \item Validation: \texttt{GSM8325049} (Control, day 9) and \texttt{GSM8325054} (Patient, day 0)
+    \item Train: \texttt{GSM8325046, 5047, 5048, 5050, 5051, 5053, 5055, 5057}
+\end{itemize}
+This split keeps GSM disjoint, but it mixes differentiation days across partitions, which can induce day--genotype confounding.
+
+\paragraph{Day-matched split (confound-reduced).}
+To reduce day--genotype confounding, we define a day-matched split by selecting two days:
+a \texttt{test\_day} and a \texttt{val\_day}.
+
+For \texttt{test\_day=19} and \texttt{val\_day=0}, the split becomes:
+\begin{itemize}
+    \item Test: \texttt{GSM8325052} (Control, day 19) and \texttt{GSM8325057} (Patient, day 19)
+    \item Validation: \texttt{GSM8325046} (Control, day 0) and \texttt{GSM8325054} (Patient, day 0)
+    \item Train: all remaining \texttt{GSM}s from days 2, 4, 9, 16, 30
+\end{itemize}
+
+
+\subsection{Preprocessing}
+\label{subsec:preproc}
+
+All preprocessing is implemented in \texttt{prepare\_dataset.py} with fixed defaults (seed 42). Key parameters:
+\begin{itemize}
+    \item Max cells per sample: \texttt{max\_cells\_per\_sample = 3000}
+    \item QC thresholds: \texttt{min\_genes=200}, \texttt{max\_genes=6000}, \texttt{max\_mito\_pct=20.0}
+    \item Normalization target: \texttt{target\_sum = 10000}
+    \item Feature filter: remove genes expressed in $<10$ cells (\texttt{min\_cells\_per\_gene=10})
+    \item Highly variable genes: \texttt{n\_hvg = 1000}
+    \item Scaling clip: \texttt{scale\_clip = 10.0}
+\end{itemize}
+
+\subsubsection{Quality control and subsampling}
+\label{subsubsec:qc}
+For each cell we compute detected gene count and mitochondrial fraction (genes starting with \texttt{MT-}).
+Cells are kept if:
+\[
+200 \le \texttt{n\_genes} \le 6000, \quad \texttt{pct\_mt} \le 20\%.
+\]
+To control RAM/time, we randomly subsample up to 3000 cells per GSM (fixed seed).
+
+\subsubsection{Normalization and log transform}
+\label{subsubsec:norm}
+Counts are normalized per cell to a fixed total (\texttt{target\_sum=10000}) and log-transformed:
+\[
+x \leftarrow \log(1+x).
+\]
+
+\subsubsection{Highly variable genes (HVG)}
+\label{subsubsec:hvg}
+To reduce dimensionality, we select 1000 genes with the highest variance on log-normalized values (after removing genes expressed in fewer than 10 cells).
+These HVGs are used as the model input features.
+
+\subsubsection{Scaling}
+\label{subsubsec:scaling}
+Each gene is scaled by dividing by its standard deviation and clipped to $[-10, +10]$.
+We do not mean-center features to avoid densifying sparse matrices.
+
+\subsubsection{Two-pass, RAM-safe implementation}
+\label{subsubsec:twopass}
+To avoid concatenating all data in memory, preprocessing runs in two passes:
+\begin{itemize}
+    \item Pass 1: iterate over training GSMs, apply QC + normalization/log1p, and accumulate per-gene statistics to select HVGs and compute scaling factors.
+    \item Pass 2: iterate over all GSMs, apply the HVG list and scaling factors from Pass 1, and build the final sparse matrix.
+\end{itemize}
+
+
+\subsection{Models}
+\label{subsec:models}
+
+Both models use the same backbone implemented in \texttt{train.py}.
+Default training hyperparameters are: learning rate $10^{-3}$, width 512, depth 2, dropout 0.3, ReLU, Adam, batch size 256, max epochs 40, early stopping with patience 8 (monitoring validation AUC).
+
+\subsubsection{Model A: genotype-only MLP}
+\label{subsubsec:modelA}
+Model A predicts genotype with a multilayer perceptron:
+Dense $\rightarrow$ BatchNorm $\rightarrow$ Activation $\rightarrow$ Dropout repeated for each hidden layer, followed by a sigmoid output.
+Loss is binary cross-entropy.
+
+\subsubsection{Model B: multitask genotype + time point}
+\label{subsubsec:modelB}
+Model B shares the same backbone but adds a 7-way softmax head predicting the time point.
+The combined loss is:
+\[
+L = L_{\mathrm{geno}} + \alpha L_{\mathrm{day}},
+\]
+where $\alpha$ corresponds to \texttt{loss\_w\_day} (default 0.3).
+
+\subsection{Hyperparameter variations (assignment requirement)}
+\label{subsec:sweep}
+
+To satisfy the assignment requirement to test different configurations, we ran a small sweep (via \texttt{sweep.py}) changing:
+\begin{itemize}
+    \item Depth: 1 vs 2
+    \item Epoch budget: 20 vs 50 (with early stopping active)
+    \item Batch size: 128 vs 512
+    \item Activation: ReLU vs tanh
+    \item Optimizer: Adam vs SGD
+\end{itemize}
+This is not an exhaustive search. It is a targeted set of variations covering the required categories.
+
+\subsection{Evaluation metrics}
+\label{subsec:eval}
+
+We report:
+\begin{itemize}
+    \item \textbf{Loss} (cross-entropy objective),
+    \item \textbf{Accuracy} at threshold 0.5,
+    \item \textbf{ROC-AUC} (threshold-free ranking metric).
+\end{itemize}
+Plots (loss curve, accuracy curve, ROC curve, confusion matrix) are generated by \texttt{evaluate.py} and included in the submission ZIP as PNG.
+
+% ---------------- Results ----------------
+\section{Results}
+\label{sec:results}
+
+\subsection{Split scheme matters: original vs day-matched}
+\label{subsec:split_results}
+
+Table~\ref{tab:split_compare} shows genotype performance for several splits.
+The original mixed-day split produces an \textbf{inverted ROC} (AUC well below 0.5), consistent with the model learning a day-associated shortcut that does not generalize.
+Day-matched splits yield substantially higher AUC, indicating improved generalization when day--genotype confounding is reduced.
+Accuracy is reported at a fixed threshold of 0.5 and can therefore look poor even when AUC is high.
+
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccccc}
+\toprule
+Run (split) & Model & $n_{\text{test}}$ & Test AUC & Test acc & Genotype loss & Combined loss \\
+\midrule
+original & A & 4130 & 0.239 & 0.279 & 10.056 & 10.056 \\
+day-matched (test=0, val=16) & A & 4630 & 0.820 & 0.598 & 1.968 & 1.968 \\
+day-matched (test=16, val=0) & A & 4741 & 0.944 & 0.803 & 0.734 & 0.734 \\
+day-matched (test=19, val=0) & A & 3287 & 0.871 & 0.555 & 1.708 & 1.708 \\
+\midrule
+original & B & 4130 & 0.141 & 0.200 & 6.819 & 7.002 \\
+day-matched (test=0, val=16) & B & 4630 & 0.641 & 0.505 & 3.181 & 7.435 \\
+day-matched (test=16, val=0) & B & 4741 & 0.960 & 0.908 & 0.376 & 4.077 \\
+day-matched (test=19, val=0) & B & 3287 & 0.936 & 0.773 & 0.681 & 4.387 \\
+\bottomrule
+\end{tabular}
+\caption{Split-scheme comparison. The original mixed-day split yields inverted performance. Day-matched splits substantially improve generalization. For Model B, the combined loss includes the auxiliary day objective; genotype loss refers to the genotype head.}
+\label{tab:split_compare}
+\end{table}
+\FloatBarrier
+
+\begin{figure}[!htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/orig_A_roc.png}
+    \caption{Original split (inverted ROC).}
+    \label{fig:roc-orig-a}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/dm_t16_v0_A_roc.png}
+    \caption{Day-matched split (test day 16, val day 0).}
+    \label{fig:roc-dm16-a}
+  \end{subfigure}
+  \caption{ROC curves for Model A under two split schemes.}
+  \label{fig:roc-compare}
+\end{figure}
+\FloatBarrier
+
+\subsection{Hyperparameter sweep (Model A on day-matched test=19, val=0)}
+\label{subsec:sweep_results}
+
+We ran a small sweep covering the required configuration categories.
+Table~\ref{tab:sweepA} shows that AUC varied from 0.888 to 0.936 across tested settings.
+The best AUC in this sweep was obtained using tanh activation (AUC 0.936).
+Increasing batch size to 512 also improved AUC relative to the baseline 128-batch run in this split.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+Run & Depth & Batch & Act / Opt & Test AUC & Test acc / loss \\
+\midrule
+A\_d1\_e20\_b128\_relu\_adam & 1 & 128 & ReLU / Adam & 0.907 & 0.834 \; / \; 0.559 \\
+A\_d2\_e20\_b128\_relu\_adam & 2 & 128 & ReLU / Adam & 0.913 & 0.848 \; / \; 0.520 \\
+A\_d1\_e50\_b128\_relu\_adam & 1 & 128 & ReLU / Adam & 0.907 & 0.834 \; / \; 0.559 \\
+A\_d1\_e20\_b512\_relu\_adam & 1 & 512 & ReLU / Adam & 0.929 & 0.854 \; / \; 0.521 \\
+A\_d1\_e20\_b128\_tanh\_adam & 1 & 128 & tanh / Adam & \textbf{0.936} & 0.847 \; / \; 0.401 \\
+A\_d1\_e20\_b128\_relu\_sgd  & 1 & 128 & ReLU / SGD  & 0.888 & 0.815 \; / \; 0.447 \\
+\bottomrule
+\end{tabular}
+\caption{Model A hyperparameter sweep results (day-matched split: test day 19, validation day 0). Early stopping was active, so the requested epoch budget does not imply the model trained all epochs.}
+\label{tab:sweepA}
+\end{table}
+\FloatBarrier
+
+\subsection{Model B does not consistently improve genotype AUC}
+\label{subsec:modelB_results}
+
+Model B was designed to test whether auxiliary supervision (predicting the differentiation time point) improves genotype generalization.
+Across the evaluated day-matched splits, Model B improved genotype AUC for test day 16 (0.960 vs 0.944) and test day 19 (0.936 vs 0.871), but underperformed on test day 0 (0.641 vs 0.820).
+This suggests that the auxiliary objective can help in some held-out-day settings, but the effect is not robust across splits in this small dataset (12 GSM libraries).
+
+\begin{figure}[!htbp]
+  \centering
+  \includegraphics[width=\linewidth]{figures/auc_by_split.png}
+  \caption{Genotype ROC-AUC across split schemes for Model A and Model B. $\Delta$ denotes (Model B $-$ Model A). Model B improves AUC for some held-out days (16 and 19) but not consistently (day 0).}
+  \label{fig:auc-split-compare}
+\end{figure}
+\FloatBarrier
+
+
+
+% ---------------- Discussion ----------------
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Main takeaway: split design dominates performance}
+The biggest observed factor was the split scheme.
+Even with GSM-level splitting (no shared libraries across partitions), mixing differentiation days across train/val/test can create a shortcut where the network learns day-associated expression structure that correlates with genotype in the training set.
+When this association changes in validation/test, performance can collapse and even invert (AUC $<0.5$).
+Day-matched splitting reduces this confound by forcing evaluation on a held-out day with both genotypes present.
+
+
+\subsection{Limitations}
+\begin{itemize}
+    \item \textbf{Small number of libraries.} With only 12 GSMs, estimates of generalization can be noisy and sensitive to which day is held out.
+    \item \textbf{Biological replication.} ``Patient vs control'' may partly reflect line or batch specific effects. Stronger conclusions would require more donors.
+    \item \textbf{Non-independence of cells.} Cell-level metrics can overstate confidence because cells within the same GSM library are correlated. The effective number of independent units is closer to the number of GSM libraries.
+\end{itemize}
+
+% ---------------- Conclusion ----------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+We implemented a RAM-safe scRNA-seq preprocessing pipeline and trained TensorFlow/Keras neural networks to classify patient/control status from single-cell expression vectors.
+Evaluation was performed with GSM-level splitting to avoid library leakage and with an additional day-matched split scheme to reduce day--genotype confounding.
+Under day-matched splits, a simple MLP (Model A) achieved high ROC-AUC (up to 0.94), while a multitask genotype+day model (Model B) did not consistently improve genotype performance.
+Overall, the results highlight that careful split design can matter more than model complexity for scRNA-seq classification.
+
+% ---------------- References (minimal) ----------------
+\begin{thebibliography}{9}
+\setlength{\parskip}{0ex}
+
+\bibitem{geo}
+NCBI Gene Expression Omnibus (GEO): GSE269705.
+\textless\url{https://www.ncbi.nlm.nih.gov/geo/}\textgreater
+
+\bibitem{tensorflow}
+TensorFlow.
+\textless\url{https://www.tensorflow.org/}\textgreater
+
+\bibitem{keras}
+Keras.
+\textless\url{https://keras.io/}\textgreater
+
+\end{thebibliography}
+
+
+
+% ---------------- Appendix ----------------
+\appendix
+\section*{Appendix: Reproducibility}
+
+
+
+Here are command snippets that reproduce the main results shown in Section~\ref{sec:results}.
+The full pipeline instructions are in \texttt{README.md}.
+
+\paragraph{Dataset preparation.}
+\begin{cmd}
+python src/prepare_dataset.py --out_dir data/processed_original  --split_scheme original
+
+python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16  --split_scheme day_matched --split_test_day 0  --split_val_day 16
+python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0  --split_scheme day_matched --split_test_day 16 --split_val_day 0
+python src/prepare_dataset.py --out_dir data/processed_dm_t19_v0  --split_scheme day_matched --split_test_day 19 --split_val_day 0
+\end{cmd}
+
+\paragraph{Training.}
+\begin{cmd}
+python src/train.py --data_dir data/processed_original   --out_dir outputs/runs/orig_A     --model A
+python src/train.py --data_dir data/processed_original   --out_dir outputs/runs/orig_B     --model B
+
+python src/train.py --data_dir data/processed_dm_t0_v16   --out_dir outputs/runs/dm_t0_v16_A  --model A
+python src/train.py --data_dir data/processed_dm_t0_v16   --out_dir outputs/runs/dm_t0_v16_B  --model B
+python src/train.py --data_dir data/processed_dm_t16_v0   --out_dir outputs/runs/dm_t16_v0_A  --model A
+python src/train.py --data_dir data/processed_dm_t16_v0   --out_dir outputs/runs/dm_t16_v0_B  --model B
+python src/train.py --data_dir data/processed_dm_t19_v0   --out_dir outputs/runs/dm_t19_v0_A  --model A
+python src/train.py --data_dir data/processed_dm_t19_v0   --out_dir outputs/runs/dm_t19_v0_B  --model B
+\end{cmd}
+
+\paragraph{Evaluation plots.}
+\begin{cmd}
+python src/evaluate.py --run_dir outputs/runs/orig_A
+python src/evaluate.py --run_dir outputs/runs/orig_B
+python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_A
+python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_B
+python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_A
+python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_B
+python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_A
+python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_B
+\end{cmd}
+
+
+\end{document}
