@@ -1,55 +1,3 @@
-
-
-
-Original - split is mix of days ->
-    Train has 8 GSM samples
-    Val has (1 control, 1 patient) both from different days
-    Test has (1 control, 1 patient) both from different days
--> day–genotype confounding: day/timepoint strongly affects expression, and the split makes some days appear with only one genotype in training, so the model can learn a spurious shortcut “day-associated expression pattern → genotype”. When the day↔genotype association differs between train and test, this shortcut can systematically flip predictions, producing an inverted ROC curve (AUC < 0.5).
-
-split_scheme - split by days intact ->
-    Test has 2 samples from the same day
-    Val has 2 samples from the same day
-    Train all of the left samples
--> days are disjoint across train/val/test, and genotype is evaluated within the same day in val/test, so day-specific expression patterns alone cannot solve the task.
-
-run A/B models 
-- Model A -> single-task: predicts genotype from RNA expression vectors.
-
-- Model B -> multitask: same RNA vectors as input, but two output heads:
-    (1) genotype (binary)
-    (2) day/timepoint (multiclass, auxiliary target)
-    Day is NOT an input feature.
-
-
-
-python src/prepare_dataset.py --out_dir data/processed_original --split_scheme original
-python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16 --split_scheme day_matched --split_test_day 0  --split_val_day 16
-python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0 --split_scheme day_matched --split_test_day 16 --split_val_day 0
-python src/prepare_dataset.py --out_dir data/processed_dm_t19_v0 --split_scheme day_matched --split_test_day 19 --split_val_day 0
-
-
-python src/train.py --data_dir data/processed_original --out_dir outputs/runs/orig_A --model A
-python src/train.py --data_dir data/processed_original --out_dir outputs/runs/orig_B --model B
-
-python src/train.py --data_dir data/processed_dm_t0_v16 --out_dir outputs/runs/dm_t0_v16_A --model A 
-python src/train.py --data_dir data/processed_dm_t0_v16 --out_dir outputs/runs/dm_t0_v16_B --model B 
-python src/train.py --data_dir data/processed_dm_t16_v0 --out_dir outputs/runs/dm_t16_v0_A --model A
-python src/train.py --data_dir data/processed_dm_t16_v0 --out_dir outputs/runs/dm_t16_v0_B --model B
-python src/train.py --data_dir data/processed_dm_t19_v0 --out_dir outputs/runs/dm_t19_v0_A --model A
-python src/train.py --data_dir data/processed_dm_t19_v0 --out_dir outputs/runs/dm_t19_v0_B --model B
-
-
-python src/evaluate.py --run_dir outputs/runs/orig_A 
-python src/evaluate.py --run_dir outputs/runs/orig_B 
-python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_A 
-python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_B
-python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_A 
-python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_B
-python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_A
-python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_B 
-
-
 LMNA scRNA-seq TensorFlow pipeline
 
 This repo contains a fully repeatable pipeline for dataset preparation, training, sweeps, and evaluation.
@@ -82,6 +30,9 @@ Day-matched split (recommended for leakage control)
 You can create multiple day-matched variants as needed:
   python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16 --split_scheme day_matched --split_test_day 0  --split_val_day 16
   python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0 --split_scheme day_matched --split_test_day 16 --split_val_day 0
+
+Leakage control note:
+HVG selection and scaling statistics are fit on the training split only, then frozen and applied to val/test.
 
 Minimal course sweep (Model A only)
 This sweep covers:
@@ -121,3 +72,44 @@ Reproducibility notes
 - The dataset preparation is seeded; keep the same split flags for repeatable splits.
 - The training script uses a fixed seed; results should be repeatable when the same
   environment and GPU/CPU backend are used.
+
+
+
+
+
+One-piece command snippet to run after preparing dataset.
+
+# 1) Rebuild datasets (train‑only HVG/scaling)
+python src/prepare_dataset.py --out_dir data/processed_original  --split_scheme original
+python src/prepare_dataset.py --out_dir data/processed_dm_t0_v16 --split_scheme day_matched --split_test_day 0  --split_val_day 16
+python src/prepare_dataset.py --out_dir data/processed_dm_t16_v0 --split_scheme day_matched --split_test_day 16 --split_val_day 0
+python src/prepare_dataset.py --out_dir data/processed_dm_t19_v0 --split_scheme day_matched --split_test_day 19 --split_val_day 0
+
+# 2) Train default runs for Table 1 (A+B on each split)
+python src/train.py --data_dir data/processed_original  --out_dir outputs/runs/orig_A      --model A
+python src/train.py --data_dir data/processed_original  --out_dir outputs/runs/orig_B      --model B
+python src/train.py --data_dir data/processed_dm_t0_v16 --out_dir outputs/runs/dm_t0_v16_A --model A
+python src/train.py --data_dir data/processed_dm_t0_v16 --out_dir outputs/runs/dm_t0_v16_B --model B
+python src/train.py --data_dir data/processed_dm_t16_v0 --out_dir outputs/runs/dm_t16_v0_A --model A
+python src/train.py --data_dir data/processed_dm_t16_v0 --out_dir outputs/runs/dm_t16_v0_B --model B
+python src/train.py --data_dir data/processed_dm_t19_v0 --out_dir outputs/runs/dm_t19_v0_A --model A
+python src/train.py --data_dir data/processed_dm_t19_v0 --out_dir outputs/runs/dm_t19_v0_B --model B
+
+# 3) (Optional) evaluation plots for each run
+python src/evaluate.py --run_dir outputs/runs/orig_A
+python src/evaluate.py --run_dir outputs/runs/orig_B
+python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_A
+python src/evaluate.py --run_dir outputs/runs/dm_t0_v16_B
+python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_A
+python src/evaluate.py --run_dir outputs/runs/dm_t16_v0_B
+python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_A
+python src/evaluate.py --run_dir outputs/runs/dm_t19_v0_B
+
+# 4) Table 1 data (genotype‑head metrics for Model B)
+python src/make_table1.py
+
+# 5) AUC comparison figure (Model A vs B across splits)
+python src/plot_auc_splits.py
+
+# 6) Sweep table (Model A on dm_t19_v0)
+python src/sweep.py --model A --data_dir data/processed_dm_t19_v0 --out_csv results.csv
