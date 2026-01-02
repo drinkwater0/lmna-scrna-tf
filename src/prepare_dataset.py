@@ -259,7 +259,6 @@ def main(
     raw_root_p = Path(raw_root)
     out_dir_p = Path(out_dir)
     out_dir_p.mkdir(parents=True, exist_ok=True)
-    r = rng(seed)
 
     gsm_files = find_10x_files_flat(raw_root_p, which=which)
     missing = sorted(set(SAMPLES.keys()) - set(gsm_files.keys()))
@@ -279,6 +278,12 @@ def main(
     )
     train_set, val_set, test_set = set(train_samples), set(val_samples), set(test_samples)
 
+    gsm_index = {gsm: i for i, gsm in enumerate(gsm_list)}
+
+    def sample_rng(gsm: str) -> np.random.Generator:
+        # Deterministic per-sample RNG keeps downsampling consistent across passes.
+        return rng(seed + gsm_index[gsm])
+
     def split_of(gsm: str) -> str:
         if gsm in train_set: return "train"
         if gsm in val_set:   return "val"
@@ -290,7 +295,12 @@ def main(
     mt_mask0 = np.array([g.startswith("MT-") for g in genes0], dtype=bool)
     n_genes0 = len(genes0)
 
-    # Stats accumulators for HVG (over normalized+log data)
+    for gsm in gsm_list[1:]:
+        genes = load_features(gsm_files[gsm]["features"])
+        if len(genes) != n_genes0 or not np.all(genes == genes0):
+            raise RuntimeError(f"[{gsm}] features.tsv.gz does not match the first sample.")
+
+    # Stats accumulators for HVG (over normalized+log data, train only)
     sum_g = np.zeros(n_genes0, dtype=np.float64)
     sumsq_g = np.zeros(n_genes0, dtype=np.float64)
     nnz_g = np.zeros(n_genes0, dtype=np.int64)
@@ -298,9 +308,11 @@ def main(
 
     qc_summary = {}
 
-    # ---- Pass 1: QC + normalize+log + accumulate gene stats (NO CONCAT)
-    for gsm in tqdm(gsm_list, desc=f"PASS1 stats ({which})"):
+    # ---- Pass 1: QC + normalize+log + accumulate gene stats (train only, NO CONCAT)
+    for gsm in tqdm(gsm_list, desc=f"PASS1 stats (train only, {which})"):
         f = gsm_files[gsm]
+        if gsm not in train_set:
+            continue
 
         genes = load_features(f["features"])
         if len(genes) != n_genes0 or not np.all(genes == genes0):
@@ -311,7 +323,7 @@ def main(
         X = load_matrix_mtx(f["matrix"])
         X = transpose_if_needed(X, n_genes=n_genes0, n_cells=len(barcodes))
 
-        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, r)
+        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, sample_rng(gsm))
         X, barcodes, qcinfo = qc_filter_cells(
             X, barcodes, mt_mask0, qc_min_genes, qc_max_genes, qc_max_mito_pct
         )
@@ -363,10 +375,12 @@ def main(
         X = load_matrix_mtx(f["matrix"])
         X = transpose_if_needed(X, n_genes=n_genes0, n_cells=len(barcodes))
 
-        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, r)
-        X, barcodes, _ = qc_filter_cells(
+        X, barcodes = downsample_rows(X, barcodes, max_cells_per_sample, sample_rng(gsm))
+        X, barcodes, qcinfo = qc_filter_cells(
             X, barcodes, mt_mask0, qc_min_genes, qc_max_genes, qc_max_mito_pct
         )
+        if gsm not in qc_summary:
+            qc_summary[gsm] = qcinfo
         X = normalize_total_log1p_inplace(X, target_sum=target_sum)
 
         # subset HVG
@@ -425,8 +439,9 @@ def main(
         "hvg": {
             "n_hvg": int(len(hvg_idx)),
             "method": "variance_on_log_normalized (streaming)",
+            "fit_split": "train",
         },
-        "scale": {"zero_center": False, "clip": float(scale_clip)},
+        "scale": {"zero_center": False, "clip": float(scale_clip), "fit_split": "train"},
         "splits": {
             "train_samples": train_samples,
             "val_samples": val_samples,

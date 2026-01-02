@@ -76,34 +76,53 @@ def extract_test_metrics(model: str, metrics: dict[str, Any]) -> dict[str, Any]:
     Model B writes many keys from Keras: includes loss + genotype_* + timepoint_*
     """
     model = model.upper()
-    out = {"test_loss": None, "test_acc": None, "test_auc": None, "test_day_acc": None}
+    out = {
+        "test_loss": None,
+        "test_acc": None,
+        "test_auc": None,
+        "test_day_acc": None,
+        "test_genotype_loss": None,
+        "test_genotype_acc": None,
+        "test_genotype_auc": None,
+        "test_day_loss": None,
+    }
 
     if model == "A":
         out["test_loss"] = safe_get(metrics, ["loss"])
+        out["test_genotype_loss"] = out["test_loss"]
         out["test_acc"]  = safe_get(metrics, ["acc", "binary_accuracy"])
         out["test_auc"]  = safe_get(metrics, ["auc"])
+        out["test_genotype_acc"] = out["test_acc"]
+        out["test_genotype_auc"] = out["test_auc"]
         return out
 
     # Model B
     out["test_loss"] = safe_get(metrics, ["loss"])
+    out["test_genotype_loss"] = safe_get(metrics, ["genotype_loss", "genotype_loss_1", "genotype_genotype_loss"])
+    out["test_day_loss"] = safe_get(metrics, ["timepoint_loss", "timepoint_loss_1", "timepoint_timepoint_loss"])
 
     out["test_acc"] = safe_get(metrics, [
         "genotype_acc",
         "genotype_binary_accuracy",
         "genotype_acc_1",
         "genotype_binary_accuracy_1",
+        "genotype_genotype_acc",
     ])
 
     out["test_auc"] = safe_get(metrics, [
         "genotype_auc",
         "genotype_auc_1",
+        "genotype_genotype_auc",
     ])
+    out["test_genotype_acc"] = out["test_acc"]
+    out["test_genotype_auc"] = out["test_auc"]
 
     out["test_day_acc"] = safe_get(metrics, [
         "timepoint_acc",
         "timepoint_sparse_categorical_accuracy",
         "timepoint_acc_1",
         "timepoint_sparse_categorical_accuracy_1",
+        "timepoint_timepoint_acc",
     ])
 
     return out
@@ -320,6 +339,10 @@ def main():
                 "test_loss": test_norm.get("test_loss"),
                 "test_acc": test_norm.get("test_acc"),
                 "test_auc": test_norm.get("test_auc"),
+                "test_genotype_loss": test_norm.get("test_genotype_loss"),
+                "test_genotype_acc": test_norm.get("test_genotype_acc"),
+                "test_genotype_auc": test_norm.get("test_genotype_auc"),
+                "test_day_loss": test_norm.get("test_day_loss"),
                 "test_day_acc": test_day_acc_val,
             }
             results.append(row)
@@ -337,7 +360,9 @@ def main():
         "batch_size", "lr", "width", "depth", "dropout", "loss_w_day",
         "widths", "arch", "activation", "optimizer", "loss_geno", "loss_day",
         "conv_filters", "kernel_size", "pool_size", "momentum",
-        "test_loss", "test_acc", "test_auc", "test_day_acc",
+        "test_loss", "test_acc", "test_auc",
+        "test_genotype_loss", "test_genotype_acc", "test_genotype_auc",
+        "test_day_loss", "test_day_acc",
     ]
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
