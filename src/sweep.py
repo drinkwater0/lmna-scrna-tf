@@ -21,6 +21,43 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _to_float(val: Any) -> Optional[float]:
+    try:
+        if val is None or val == "":
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _pick_best_a_run(results_csv: Path) -> Optional[str]:
+    if not results_csv.exists():
+        return None
+    with results_csv.open("r", newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if str(r.get("model", "")).upper() == "A"]
+    if not rows:
+        return None
+
+    def score(row: dict[str, Any]) -> tuple[bool, float]:
+        for key in ("best_val_auc", "test_auc", "test_acc"):
+            v = _to_float(row.get(key))
+            if v is not None:
+                return True, v
+        return False, -1.0
+
+    best = max(rows, key=score)
+    return best.get("run")
+
+
+def _load_best_a_config(base_out: Path, run_name: str) -> Optional[dict[str, Any]]:
+    if not run_name:
+        return None
+    cfg_path = base_out / run_name / "config.json"
+    if not cfg_path.exists():
+        return None
+    return read_json(cfg_path)
+
+
 def safe_get(d: dict[str, Any], keys: list[str]) -> Optional[float]:
     """Return first float value found for any key in keys."""
     for k in keys:
@@ -106,6 +143,9 @@ def main():
     ap.add_argument("--model", choices=["A", "B", "both"], default="A")
     ap.add_argument("--data_dir", default="data/processed")
     ap.add_argument("--base_out", default="outputs/runs")
+    ap.add_argument("--out_csv", default="results.csv", help="Output CSV filename or path.")
+    ap.add_argument("--best_a_run", default="", help="Name of the Model A run to seed Model B.")
+    ap.add_argument("--best_a_csv", default="", help="CSV to pick the best Model A run (defaults to outputs/runs/results.csv).")
     ap.add_argument("--rerun", action="store_true", help="Re-run even if outputs exist")
     ap.add_argument("--dry_run", action="store_true", help="Print commands only")
     args = ap.parse_args()
@@ -117,23 +157,70 @@ def main():
     base_out.mkdir(parents=True, exist_ok=True)
 
     # ---- Define sweep ----
-    sweep_A = [
-        # baseline: single-layer (depth=1, dropout=0.0)
-        dict(name="A_baseline_d1_e30_b256", model="A", epochs=30, batch_size=256, depth=1, width=512, dropout=0.0, lr=1e-3),
-        # core MLP
-        dict(name="A_mlp_d2_e10_b256",      model="A", epochs=10, batch_size=256, depth=2, width=512, dropout=0.3, lr=1e-3),
-        dict(name="A_mlp_d2_e30_b256",      model="A", epochs=30, batch_size=256, depth=2, width=512, dropout=0.3, lr=1e-3),
-        dict(name="A_mlp_d2_e30_b512",      model="A", epochs=30, batch_size=512, depth=2, width=512, dropout=0.3, lr=1e-3),
-        dict(name="A_mlp_d3_e30_b256",      model="A", epochs=30, batch_size=256, depth=3, width=512, dropout=0.3, lr=1e-3),
-        dict(name="A_mlp_d3_e50_b512",      model="A", epochs=50, batch_size=512, depth=3, width=512, dropout=0.3, lr=1e-3),
-        dict(name="A_mlp_d2_e10_b128",      model="A", epochs=10, batch_size=128, depth=2, width=512, dropout=0.3, lr=1e-3),
+    base_cfg = dict(
+        epochs=20,
+        batch_size=128,
+        lr=1e-3,
+        width=512,
+        depth=1,
+        dropout=0.0,
+        widths="",
+        arch="mlp",
+        activation="relu",
+        optimizer="adam",
+        loss_geno="binary_crossentropy",
+        loss_day="sparse_categorical_crossentropy",
+        conv_filters="32,64",
+        kernel_size=5,
+        pool_size=2,
+        momentum=0.9,
+        loss_w_day=0.3,
+    )
+
+    sweep_base = [
+        # single-layer network (depth=1, dropout=0)
+        dict(name="d1_e20_b128_relu_adam", depth=1),
+        # multi-layer network (depth=2)
+        dict(name="d2_e20_b128_relu_adam", depth=2),
+        # change epochs (20 vs 50)
+        dict(name="d1_e50_b128_relu_adam", epochs=50),
+        # change batch size (128 vs 512)
+        dict(name="d1_e20_b512_relu_adam", batch_size=512),
+        # change activation (relu vs tanh)
+        dict(name="d1_e20_b128_tanh_adam", activation="tanh"),
+        # change optimizer (adam vs sgd)
+        dict(name="d1_e20_b128_relu_sgd", optimizer="sgd"),
     ]
 
-    sweep_B = [
-        dict(name="B_mlp_d2_e30_b256_a03", model="B", epochs=30, batch_size=256, depth=2, width=512, dropout=0.3, lr=1e-3, loss_w_day=0.3),
-        dict(name="B_mlp_d2_e30_b256_a01", model="B", epochs=30, batch_size=256, depth=2, width=512, dropout=0.3, lr=1e-3, loss_w_day=0.1),
-        dict(name="B_mlp_d2_e30_b256_a05", model="B", epochs=30, batch_size=256, depth=2, width=512, dropout=0.3, lr=1e-3, loss_w_day=0.5),
+    sweep_A = [
+        {**base_cfg, **{k: v for k, v in cfg.items() if k != "name"}, "model": "A", "name": f"A_{cfg['name']}"}
+        for cfg in sweep_base
     ]
+
+    # Model B: use best Model A config and vary only loss_w_day.
+    default_best_csv = Path(args.best_a_csv) if args.best_a_csv else (base_out / "results.csv")
+    best_a_run = args.best_a_run or _pick_best_a_run(default_best_csv)
+    best_a_cfg = _load_best_a_config(base_out, best_a_run) if best_a_run else None
+    if best_a_run and best_a_cfg is None:
+        print(f"WARNING: best_a_run '{best_a_run}' has no config.json; using base defaults for Model B.")
+    if not best_a_run:
+        print("WARNING: No best Model A run found; using base defaults for Model B.")
+
+    b_base_cfg = dict(base_cfg)
+    if best_a_cfg:
+        for key in (
+            "epochs", "batch_size", "lr", "width", "depth", "dropout",
+            "widths", "arch", "activation", "optimizer", "loss_geno", "loss_day",
+            "conv_filters", "kernel_size", "pool_size", "momentum",
+        ):
+            if key in best_a_cfg:
+                b_base_cfg[key] = best_a_cfg[key]
+
+    b_prefix = f"B_from_{best_a_run}" if best_a_run else "B_base"
+    sweep_B = []
+    for lw in (0.1, 0.3, 0.5):
+        name = f"{b_prefix}_a{int(lw * 100):02d}"
+        sweep_B.append({**b_base_cfg, "model": "B", "loss_w_day": lw, "name": name})
 
     if args.model == "A":
         sweep = sweep_A
@@ -164,7 +251,21 @@ def main():
                 "--width", str(cfg["width"]),
                 "--depth", str(cfg["depth"]),
                 "--dropout", str(cfg["dropout"]),
+                "--arch", str(cfg.get("arch", "mlp")),
+                "--activation", str(cfg.get("activation", "relu")),
+                "--optimizer", str(cfg.get("optimizer", "adam")),
+                "--loss_geno", str(cfg.get("loss_geno", "binary_crossentropy")),
+                "--loss_day", str(cfg.get("loss_day", "sparse_categorical_crossentropy")),
+                "--momentum", str(cfg.get("momentum", 0.9)),
             ]
+            if cfg.get("widths"):
+                cmd += ["--widths", str(cfg["widths"])]
+            if cfg.get("arch", "mlp") == "cnn":
+                cmd += [
+                    "--conv_filters", str(cfg.get("conv_filters", "32,64")),
+                    "--kernel_size", str(cfg.get("kernel_size", 5)),
+                    "--pool_size", str(cfg.get("pool_size", 2)),
+                ]
             if cfg["model"].upper() == "B":
                 cmd += ["--loss_w_day", str(cfg.get("loss_w_day", 0.3))]
             run_cmd(cmd, dry_run=args.dry_run)
@@ -180,6 +281,18 @@ def main():
             model = str(conf.get("model", cfg["model"])).upper()
             test_norm = extract_test_metrics(model, mets)
             val_sum = extract_val_summary(model, hist)
+            arch = str(conf.get("arch", cfg.get("arch", "mlp")))
+            optimizer = str(conf.get("optimizer", cfg.get("optimizer", "adam")))
+            is_multitask = (model == "B")
+            is_cnn = (arch.lower() == "cnn")
+
+            loss_day_val = conf.get("loss_day", cfg.get("loss_day", "")) if is_multitask else ""
+            loss_w_day_val = conf.get("loss_w_day", cfg.get("loss_w_day", "")) if is_multitask else ""
+            test_day_acc_val = test_norm.get("test_day_acc") if is_multitask else ""
+            conv_filters_val = conf.get("conv_filters", cfg.get("conv_filters", "")) if is_cnn else ""
+            kernel_size_val = conf.get("kernel_size", cfg.get("kernel_size", "")) if is_cnn else ""
+            pool_size_val = conf.get("pool_size", cfg.get("pool_size", "")) if is_cnn else ""
+            momentum_val = conf.get("momentum", cfg.get("momentum", "")) if optimizer.lower() == "sgd" else ""
 
             row = {
                 "run": run_dir.name,
@@ -193,19 +306,37 @@ def main():
                 "width": conf.get("width", cfg["width"]),
                 "depth": conf.get("depth", cfg["depth"]),
                 "dropout": conf.get("dropout", cfg["dropout"]),
-                "loss_w_day": conf.get("loss_w_day", cfg.get("loss_w_day", "")),
-                **test_norm,
+                "widths": conf.get("widths", cfg.get("widths", "")),
+                "arch": arch,
+                "activation": conf.get("activation", cfg.get("activation", "relu")),
+                "optimizer": optimizer,
+                "loss_geno": conf.get("loss_geno", cfg.get("loss_geno", "binary_crossentropy")),
+                "loss_day": loss_day_val,
+                "conv_filters": conv_filters_val,
+                "kernel_size": kernel_size_val,
+                "pool_size": pool_size_val,
+                "momentum": momentum_val,
+                "loss_w_day": loss_w_day_val,
+                "test_loss": test_norm.get("test_loss"),
+                "test_acc": test_norm.get("test_acc"),
+                "test_auc": test_norm.get("test_auc"),
+                "test_day_acc": test_day_acc_val,
             }
             results.append(row)
         else:
             print(f"WARNING: missing outputs for {run_dir} (train may have failed or dry_run)")
 
     # Write results.csv
-    out_csv = base_out / "results.csv"
+    out_csv = Path(args.out_csv)
+    if not out_csv.is_absolute():
+        out_csv = base_out / out_csv
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "run", "model",
         "epochs_requested", "epochs_trained", "best_epoch", "best_val_auc",
         "batch_size", "lr", "width", "depth", "dropout", "loss_w_day",
+        "widths", "arch", "activation", "optimizer", "loss_geno", "loss_day",
+        "conv_filters", "kernel_size", "pool_size", "momentum",
         "test_loss", "test_acc", "test_auc", "test_day_acc",
     ]
     with out_csv.open("w", newline="", encoding="utf-8") as f:
@@ -228,4 +359,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

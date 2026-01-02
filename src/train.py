@@ -12,6 +12,35 @@ from tensorflow.keras import layers
 from scipy.sparse import load_npz
 
 
+def _parse_int_list(text: str) -> list[int]:
+    if text is None:
+        return []
+    items = [t.strip() for t in text.split(",") if t.strip()]
+    return [int(t) for t in items]
+
+
+def _build_optimizer(name: str, lr: float, momentum: float):
+    name = name.lower()
+    if name == "adam":
+        return keras.optimizers.Adam(learning_rate=lr)
+    if name == "rmsprop":
+        return keras.optimizers.RMSprop(learning_rate=lr)
+    if name == "sgd":
+        return keras.optimizers.SGD(learning_rate=lr, momentum=momentum)
+    raise ValueError(f"Unknown optimizer: {name}")
+
+
+def _build_loss(name: str):
+    name = name.lower()
+    if name in {"binary_crossentropy", "bce"}:
+        return keras.losses.BinaryCrossentropy()
+    if name in {"mean_squared_error", "mse"}:
+        return keras.losses.MeanSquaredError()
+    if name in {"sparse_categorical_crossentropy", "scc"}:
+        return keras.losses.SparseCategoricalCrossentropy()
+    raise ValueError(f"Unknown loss: {name}")
+
+
 class CSRSequence(keras.utils.Sequence):
     """
     Keras Sequence that serves dense batches from a SciPy CSR matrix.
@@ -61,16 +90,81 @@ class CSRSequence(keras.utils.Sequence):
         return Xb, {"genotype": ygeno, "timepoint": yday}
 
 
-def build_model(n_features: int, width: int, depth: int, dropout: float, multitask: bool):
+def _build_backbone(
+    n_features: int,
+    width: int,
+    depth: int,
+    dropout: float,
+    activation: str,
+    widths_list: list[int],
+    arch: str,
+    conv_filters: list[int],
+    kernel_size: int,
+    pool_size: int,
+):
+    arch = arch.lower()
+    activation = activation.lower()
     inp = keras.Input(shape=(n_features,), name="expr")
-    x = inp
-    for _ in range(depth):
-        x = layers.Dense(width, use_bias=False)(x)
-        x = layers.BatchNormalization()(x)          # OK to keep; consider LayerNorm if you want
-        x = layers.Activation("relu")(x)
-        x = layers.Dropout(dropout)(x)
 
-    shared = layers.Dense(max(width // 2, 32), activation="relu", name="shared")(x)
+    if arch == "mlp":
+        layer_widths = widths_list if widths_list else [width] * depth
+        if len(layer_widths) == 0:
+            raise ValueError("MLP requires at least one hidden layer.")
+        x = inp
+        for w in layer_widths:
+            x = layers.Dense(w, use_bias=False)(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.Activation(activation)(x)
+            x = layers.Dropout(dropout)(x)
+        shared_units = max(int(layer_widths[-1] // 2), 32)
+        shared = layers.Dense(shared_units, activation=activation, name="shared")(x)
+        return inp, shared
+
+    if arch == "cnn":
+        filters = conv_filters if conv_filters else [32, 64]
+        if len(filters) == 0:
+            raise ValueError("CNN requires at least one conv layer.")
+        # Treat gene expression vector as a 1D signal for Conv1D.
+        x = layers.Reshape((n_features, 1), name="reshape_for_conv")(inp)
+        for f in filters:
+            x = layers.Conv1D(f, kernel_size, padding="same", use_bias=False)(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.Activation(activation)(x)
+            x = layers.MaxPooling1D(pool_size=pool_size)(x)
+            x = layers.Dropout(dropout)(x)
+        x = layers.GlobalMaxPooling1D()(x)
+        shared_units = max(int(width // 2), 32)
+        shared = layers.Dense(shared_units, activation=activation, name="shared")(x)
+        return inp, shared
+
+    raise ValueError(f"Unknown architecture: {arch}")
+
+
+def build_model(
+    n_features: int,
+    width: int,
+    depth: int,
+    dropout: float,
+    multitask: bool,
+    arch: str,
+    activation: str,
+    widths_list: list[int],
+    conv_filters: list[int],
+    kernel_size: int,
+    pool_size: int,
+):
+    inp, shared = _build_backbone(
+        n_features,
+        width,
+        depth,
+        dropout,
+        activation,
+        widths_list,
+        arch,
+        conv_filters,
+        kernel_size,
+        pool_size,
+    )
 
     out_geno = layers.Dense(1, activation="sigmoid", name="genotype")(shared)
 
@@ -92,6 +186,16 @@ class TrainConfig:
     width: int
     depth: int
     dropout: float
+    widths: str
+    arch: str
+    activation: str
+    optimizer: str
+    loss_geno: str
+    loss_day: str
+    conv_filters: str
+    kernel_size: int
+    pool_size: int
+    momentum: float
     model: str
     loss_w_day: float
 
@@ -120,27 +224,46 @@ def main(cfg: TrainConfig):
     multitask = (cfg.model.upper() == "B")
     n_features = X_csr.shape[1]
 
+    widths_list = _parse_int_list(cfg.widths)
+    conv_filters = _parse_int_list(cfg.conv_filters)
+
     train_seq = CSRSequence(X_csr, y_geno, y_day, tr_idx, cfg.batch_size, shuffle=True,  multitask=multitask)
     val_seq   = CSRSequence(X_csr, y_geno, y_day, va_idx, cfg.batch_size, shuffle=False, multitask=multitask)
     test_seq  = CSRSequence(X_csr, y_geno, y_day, te_idx, cfg.batch_size, shuffle=False, multitask=multitask)
 
     # ---- Build & compile ----
-    model = build_model(n_features, cfg.width, cfg.depth, cfg.dropout, multitask)
+    model = build_model(
+        n_features,
+        cfg.width,
+        cfg.depth,
+        cfg.dropout,
+        multitask,
+        cfg.arch,
+        cfg.activation,
+        widths_list,
+        conv_filters,
+        cfg.kernel_size,
+        cfg.pool_size,
+    )
+
+    optimizer = _build_optimizer(cfg.optimizer, cfg.lr, cfg.momentum)
+    loss_geno = _build_loss(cfg.loss_geno)
+    loss_day = _build_loss(cfg.loss_day)
 
     if not multitask:
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=cfg.lr),
-            loss=keras.losses.BinaryCrossentropy(),
+            optimizer=optimizer,
+            loss=loss_geno,
             metrics=[keras.metrics.BinaryAccuracy(name="acc"),
                      keras.metrics.AUC(name="auc")],
         )
         monitor = "val_auc"
     else:
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=cfg.lr),
+            optimizer=optimizer,
             loss={
-                "genotype": keras.losses.BinaryCrossentropy(),
-                "timepoint": keras.losses.SparseCategoricalCrossentropy(),
+                "genotype": loss_geno,
+                "timepoint": loss_day,
             },
             loss_weights={"genotype": 1.0, "timepoint": float(cfg.loss_w_day)},
             metrics={
@@ -221,6 +344,16 @@ def parse_args():
     ap.add_argument("--width", type=int, default=512)
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--dropout", type=float, default=0.3)
+    ap.add_argument("--widths", default="", help="Comma-separated widths per MLP layer (overrides --width/--depth).")
+    ap.add_argument("--arch", choices=["mlp", "cnn"], default="mlp")
+    ap.add_argument("--activation", choices=["relu", "tanh", "elu", "selu"], default="relu")
+    ap.add_argument("--optimizer", choices=["adam", "sgd", "rmsprop"], default="adam")
+    ap.add_argument("--loss_geno", choices=["binary_crossentropy", "mean_squared_error"], default="binary_crossentropy")
+    ap.add_argument("--loss_day", choices=["sparse_categorical_crossentropy"], default="sparse_categorical_crossentropy")
+    ap.add_argument("--conv_filters", default="32,64", help="Comma-separated Conv1D filters (CNN only).")
+    ap.add_argument("--kernel_size", type=int, default=5)
+    ap.add_argument("--pool_size", type=int, default=2)
+    ap.add_argument("--momentum", type=float, default=0.9, help="Only used for SGD.")
     ap.add_argument("--model", choices=["A", "B"], default="A", help="A=genotype only, B=genotype + day")
     ap.add_argument("--loss_w_day", type=float, default=0.3, help="only for Model B")
     args = ap.parse_args()
